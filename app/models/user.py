@@ -1,7 +1,7 @@
 from datetime import datetime as dt
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, FieldValidationInfo, field_validator
 
 from app.db.models import UserDataLimitResetStrategy, UserStatus, UserStatusCreate
 from app.models.admin import AdminBase, AdminContactInfo
@@ -190,3 +190,59 @@ class BulkUsersProxy(BaseModel):
     group_ids: set[int] = Field(default_factory=set)
     admins: set[int] = Field(default_factory=set)
     users: set[int] = Field(default_factory=set)
+
+
+class UsernameGenerationStrategy(str, Enum):
+    provided = "provided"
+    suffix = "suffix"
+    random = "random"
+
+
+class BulkCreationBase(BaseModel):
+    count: int = Field(gt=0, le=500)
+    strategy: UsernameGenerationStrategy = Field(default=UsernameGenerationStrategy.provided)
+    usernames: list[str] | None = None
+    suffix_start: int = Field(default=1, ge=0)
+    suffix_padding: int = Field(default=0, ge=0, le=6)
+    random_length: int = Field(default=6, ge=4, le=32)
+    random_prefix: str | None = None
+
+    @field_validator("usernames", mode="after")
+    @classmethod
+    def validate_usernames(cls, value: list[str] | None, info: FieldValidationInfo):
+        strategy = info.data.get("strategy", UsernameGenerationStrategy.provided)
+        if strategy == UsernameGenerationStrategy.provided and (not value or len(value) == 0):
+            raise ValueError("usernames must be provided when strategy is 'provided'")
+        return value
+
+
+    @field_validator("count")
+    @classmethod
+    def validate_count_for_strategy(cls, value: int, info: FieldValidationInfo):
+        strategy = info.data.get("strategy", UsernameGenerationStrategy.provided)
+        usernames = info.data.get("usernames")
+        if strategy == UsernameGenerationStrategy.provided and usernames and len(usernames) < value:
+            raise ValueError("count cannot exceed the number of provided usernames")
+        return value
+
+
+class BulkUsersCreate(BulkCreationBase):
+    user: UserCreate
+
+
+class BulkUsersFromTemplate(BulkCreationBase):
+    user: CreateUserFromTemplate
+
+
+class BulkUserCreateError(BaseModel):
+    username: str
+    detail: str
+    status_code: int
+
+
+class BulkUsersCreateResponse(BaseModel):
+    users: list[UserResponse] = Field(default_factory=list)
+    errors: list[BulkUserCreateError] = Field(default_factory=list)
+    success: int = Field(default=0)
+    failed: int = Field(default=0)
+    total: int = Field(default=0)

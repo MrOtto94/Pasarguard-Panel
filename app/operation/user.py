@@ -3,7 +3,9 @@ import re
 import secrets
 from collections import Counter
 from datetime import datetime as dt, timedelta as td, timezone as tz
+from typing import Callable
 
+from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
@@ -19,12 +21,14 @@ from app.db.crud.bulk import (
 from app.db.crud.user import (
     UsersSortingOptions,
     create_user,
+    create_users_bulk,
     get_all_users_usages,
     get_expired_users,
     get_user_usages,
     get_users,
     get_users_sub_update_list,
     get_users_subscription_agent_counts,
+    get_existing_usernames,
     modify_user,
     remove_user,
     remove_users,
@@ -38,10 +42,15 @@ from app.models.admin import AdminDetails
 from app.models.stats import Period, UserUsageStatsList
 from app.models.user import (
     BulkUser,
+    BulkUserCreateError,
+    BulkUsersCreate,
+    BulkUsersCreateResponse,
+    BulkUsersFromTemplate,
     BulkUsersProxy,
     CreateUserFromTemplate,
     ModifyUserByTemplate,
     RemoveUsersResponse,
+    UsernameGenerationStrategy,
     UserCreate,
     UserModify,
     UserNotificationResponse,
@@ -66,6 +75,19 @@ _VERSION_TOKEN_RE = re.compile(r"v?\d+(?:\.\d+)*", re.IGNORECASE)
 
 class UserOperation(BaseOperation):
     @staticmethod
+    def _build_bulk_error(username: str, exc: HTTPException) -> BulkUserCreateError:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        return BulkUserCreateError(username=username, detail=detail, status_code=exc.status_code)
+
+    @staticmethod
+    def _make_bulk_error(username: str, detail: str, status_code: int) -> BulkUserCreateError:
+        return BulkUserCreateError(username=username, detail=detail, status_code=status_code)
+
+    @staticmethod
+    def _format_validation_errors(error: ValidationError) -> str:
+        return "; ".join([f"{'.'.join(str(loc_part) for loc_part in err['loc'])}: {err['msg']}" for err in error.errors()])
+
+    @staticmethod
     async def generate_subscription_url(user: UserNotificationResponse):
         salt = secrets.token_hex(8)
         settings = await subscription_settings()
@@ -76,6 +98,114 @@ class UserOperation(BaseOperation):
         )
         token = await create_subscription_token(user.username)
         return f"{url_prefix}/{SUBSCRIPTION_PATH}/{token}"
+
+    def _generate_usernames(
+        self,
+        base_username: str | None,
+        count: int,
+        strategy: UsernameGenerationStrategy,
+        usernames: list[str] | None = None,
+        suffix_start: int = 1,
+        suffix_padding: int = 0,
+        random_prefix: str | None = None,
+        random_length: int = 6,
+    ) -> list[str]:
+        if count <= 0:
+            raise HTTPException(status_code=400, detail="count must be greater than zero")
+
+        if strategy == UsernameGenerationStrategy.provided:
+            if not usernames:
+                raise HTTPException(status_code=400, detail="usernames must be provided for 'provided' strategy")
+            return list(usernames[:count])
+
+        if strategy == UsernameGenerationStrategy.suffix:
+            if not base_username:
+                raise HTTPException(status_code=400, detail="base username is required for suffix strategy")
+            generated: list[str] = []
+            for offset in range(count):
+                suffix_value = suffix_start + offset
+                suffix_str = str(suffix_value).zfill(suffix_padding) if suffix_padding else str(suffix_value)
+                generated.append(f"{base_username}{suffix_str}")
+            return generated
+
+        if strategy == UsernameGenerationStrategy.random:
+            prefix = random_prefix if random_prefix is not None else (base_username or "")
+            generated: list[str] = []
+            seen: set[str] = set()
+            max_attempts = max(100, count * 20)
+            attempts = 0
+            while len(generated) < count:
+                attempts += 1
+                if attempts > max_attempts:
+                    raise HTTPException(status_code=500, detail="unable to generate unique usernames")
+                token = secrets.token_hex((random_length + 1) // 2)[:random_length]
+                candidate = f"{prefix}{token}"
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                generated.append(candidate)
+            return generated
+
+        raise HTTPException(status_code=400, detail="unsupported username generation strategy")
+
+    def _build_bulk_user_models(self, candidate_usernames: list[str], builder) -> tuple[list[UserCreate], list[BulkUserCreateError]]:
+        users: list[UserCreate] = []
+        errors: list[BulkUserCreateError] = []
+        seen: set[str] = set()
+
+        for username in candidate_usernames:
+            if username in seen:
+                errors.append(self._make_bulk_error(username, "duplicate username in request", 400))
+                continue
+            seen.add(username)
+
+            try:
+                user_model = builder(username)
+            except HTTPException as exc:
+                errors.append(self._build_bulk_error(username, exc))
+            except ValidationError as exc:
+                errors.append(self._make_bulk_error(username, self._format_validation_errors(exc), 400))
+            else:
+                users.append(user_model)
+
+        return users, errors
+
+    async def _filter_existing_usernames(
+        self, db: AsyncSession, new_users: list[UserCreate], errors: list[BulkUserCreateError]
+    ) -> list[UserCreate]:
+        if not new_users:
+            return []
+
+        existing_usernames = await get_existing_usernames(db, [user.username for user in new_users])
+        if not existing_usernames:
+            return new_users
+
+        for username in sorted(existing_usernames):
+            errors.append(self._make_bulk_error(username, "username already exists", 409))
+
+        return [user for user in new_users if user.username not in existing_usernames]
+
+    async def _persist_bulk_users(
+        self,
+        db: AsyncSession,
+        admin: AdminDetails,
+        db_admin,
+        users_to_create: list[UserCreate],
+        groups: list,
+    ) -> list[UserResponse]:
+        if not users_to_create:
+            return []
+
+        db_users = await create_users_bulk(db, users_to_create, groups, db_admin)
+
+        responses: list[UserResponse] = []
+        for db_user in db_users:
+            user = await self.update_user(db_user)
+            asyncio.create_task(notification.create_user(user, admin))
+            logger.info(f'New user "{db_user.username}" with id "{db_user.id}" added by admin "{admin.username}"')
+            responses.append(user)
+
+        return responses
 
     async def validate_user(self, db_user: User) -> UserNotificationResponse:
         user = UserNotificationResponse.model_validate(db_user)
@@ -137,6 +267,47 @@ class UserOperation(BaseOperation):
             logger.info(f'User "{db_user.username}" status changed from "{old_status.value}" to "{user.status.value}"')
 
         return user
+
+    async def bulk_create_users(
+        self, db: AsyncSession, bulk_users: BulkUsersCreate, admin: AdminDetails
+    ) -> BulkUsersCreateResponse:
+        base_user = bulk_users.user
+
+        if base_user.next_plan is not None and base_user.next_plan.user_template_id is not None:
+            await self.get_validated_user_template(db, base_user.next_plan.user_template_id)
+
+        groups = await self.validate_all_groups(db, base_user)
+        db_admin = await get_admin(db, admin.username)
+
+        candidate_usernames = self._generate_usernames(
+            base_username=base_user.username,
+            count=bulk_users.count,
+            strategy=bulk_users.strategy,
+            usernames=bulk_users.usernames,
+            suffix_start=bulk_users.suffix_start,
+            suffix_padding=bulk_users.suffix_padding,
+            random_prefix=bulk_users.random_prefix,
+            random_length=bulk_users.random_length,
+        )
+
+        base_payload = base_user.model_dump(exclude={"username"})
+
+        def builder(username: str) -> UserCreate:
+            return UserCreate(username=username, **base_payload)
+
+        users_to_create, errors = self._build_bulk_user_models(candidate_usernames, builder)
+
+        users_to_create = await self._filter_existing_usernames(db, users_to_create, errors)
+
+        created_users = await self._persist_bulk_users(db, admin, db_admin, users_to_create, groups)
+
+        return BulkUsersCreateResponse(
+            users=created_users,
+            errors=errors,
+            success=len(created_users),
+            failed=len(errors),
+            total=bulk_users.count,
+        )
 
     async def modify_user(
         self, db: AsyncSession, username: str, modified_user: UserModify, admin: AdminDetails
@@ -433,6 +604,25 @@ class UserOperation(BaseOperation):
 
         return user_args
 
+    def _build_user_create_from_template(
+        self, user_template: UserTemplate, payload: CreateUserFromTemplate
+    ) -> UserCreate:
+        new_user_args = self.load_base_user_args(user_template)
+        new_user_args["username"] = (
+            f"{user_template.username_prefix if user_template.username_prefix else ''}"
+            f"{payload.username}"
+            f"{user_template.username_suffix if user_template.username_suffix else ''}"
+        )
+
+        try:
+            new_user = UserCreate(**new_user_args, note=payload.note)
+        except ValidationError as e:
+            raise HTTPException(status_code=400, detail=self._format_validation_errors(e))
+
+        new_user = self.apply_settings(new_user, user_template)
+
+        return new_user
+
     async def create_user_from_template(
         self, db: AsyncSession, new_template_user: CreateUserFromTemplate, admin: AdminDetails
     ) -> UserResponse:
@@ -441,18 +631,10 @@ class UserOperation(BaseOperation):
         if user_template.is_disabled:
             await self.raise_error("this template is disabled", 403)
 
-        new_user_args = self.load_base_user_args(user_template)
-        new_user_args["username"] = (
-            f"{user_template.username_prefix if user_template.username_prefix else ''}{new_template_user.username}{user_template.username_suffix if user_template.username_suffix else ''}"
-        )
-
         try:
-            new_user = UserCreate(**new_user_args, note=new_template_user.note)
-        except ValidationError as e:
-            error_messages = "; ".join([f"{err['loc'][0]}: {err['msg']}" for err in e.errors()])
-            await self.raise_error(message=error_messages, code=400)
-
-        new_user = self.apply_settings(new_user, user_template)
+            new_user = self._build_user_create_from_template(user_template, new_template_user)
+        except HTTPException as exc:
+            raise exc
 
         return await self.create_user(db, new_user, admin)
 
@@ -480,6 +662,53 @@ class UserOperation(BaseOperation):
             await self._reset_user_data_usage(db, db_user, admin)
 
         return await self._modify_user(db, db_user, modify_user, admin)
+
+    async def bulk_create_users_from_template(
+        self, db: AsyncSession, bulk_users: BulkUsersFromTemplate, admin: AdminDetails
+    ) -> BulkUsersCreateResponse:
+        template_payload = bulk_users.user
+        user_template = await self.get_validated_user_template(db, template_payload.user_template_id)
+
+        if user_template.is_disabled:
+            await self.raise_error("this template is disabled", 403)
+
+        candidate_usernames = self._generate_usernames(
+            base_username=template_payload.username,
+            count=bulk_users.count,
+            strategy=bulk_users.strategy,
+            usernames=bulk_users.usernames,
+            suffix_start=bulk_users.suffix_start,
+            suffix_padding=bulk_users.suffix_padding,
+            random_prefix=bulk_users.random_prefix,
+            random_length=bulk_users.random_length,
+        )
+
+        def builder(username: str) -> UserCreate:
+            payload = CreateUserFromTemplate(
+                username=username,
+                user_template_id=template_payload.user_template_id,
+                note=template_payload.note,
+            )
+            return self._build_user_create_from_template(user_template, payload)
+
+        users_to_create, errors = self._build_bulk_user_models(candidate_usernames, builder)
+
+        users_to_create = await self._filter_existing_usernames(db, users_to_create, errors)
+
+        groups: list = []
+        if users_to_create:
+            groups = await self.validate_all_groups(db, users_to_create[0])
+
+        db_admin = await get_admin(db, admin.username)
+        created_users = await self._persist_bulk_users(db, admin, db_admin, users_to_create, groups)
+
+        return BulkUsersCreateResponse(
+            users=created_users,
+            errors=errors,
+            success=len(created_users),
+            failed=len(errors),
+            total=bulk_users.count,
+        )
 
     async def bulk_modify_expire(self, db: AsyncSession, bulk_model: BulkUser):
         users, users_count = await update_users_expire(db, bulk_model)

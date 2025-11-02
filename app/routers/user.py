@@ -8,6 +8,9 @@ from app.models.admin import AdminDetails
 from app.models.stats import Period, UserUsageStatsList
 from app.models.user import (
     BulkUser,
+    BulkUsersCreate,
+    BulkUsersCreateResponse,
+    BulkUsersFromTemplate,
     BulkUsersProxy,
     CreateUserFromTemplate,
     ModifyUserByTemplate,
@@ -57,6 +60,30 @@ async def create_user(
     """
 
     return await user_operator.create_user(db, new_user=new_user, admin=admin)
+
+
+@router.post(
+    "s/bulk",
+    response_model=BulkUsersCreateResponse,
+    responses={400: responses._400, 409: responses._409},
+    status_code=status.HTTP_201_CREATED,
+)
+async def bulk_create_users(
+    bulk_users: BulkUsersCreate, db: AsyncSession = Depends(get_db), admin: AdminDetails = Depends(get_current)
+):
+    """
+    Bulk create users with configurable username strategies.
+
+    - **user**: Base payload that follows the single user create schema.
+    - **count**: Number of users to generate from the base payload.
+    - **strategy**: Username generation strategy — `provided`, `suffix`, or `random`.
+    - **usernames**: Required when strategy is `provided`.
+    - **suffix_* / random_* fields**: Fine-tune suffix and random strategies.
+
+    Returns a summary with created users and any per-username errors.
+    """
+
+    return await user_operator.bulk_create_users(db, bulk_users, admin)
 
 
 @router.put(
@@ -313,6 +340,30 @@ async def create_user_from_template(
     admin: AdminDetails = Depends(get_current),
 ):
     return await user_operator.create_user_from_template(db, new_template_user, admin)
+
+
+@router.post(
+    "s/bulk/from_template",
+    status_code=status.HTTP_201_CREATED,
+    response_model=BulkUsersCreateResponse,
+    responses={400: responses._400, 403: responses._403, 404: responses._404, 409: responses._409},
+)
+async def bulk_create_users_from_template(
+    bulk_template_users: BulkUsersFromTemplate,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminDetails = Depends(get_current),
+):
+    """
+    Bulk create users from a template using configurable username strategies.
+
+    - **user**: Base payload for the template creation endpoint.
+    - **count**: Number of users to create.
+    - **strategy**: Username generation strategy — `provided`, `suffix`, or `random`.
+
+    Returns a summary with created users and any per-username errors.
+    """
+
+    return await user_operator.bulk_create_users_from_template(db, bulk_template_users, admin)
 
 
 @router.put("/from_template/{username}", response_model=UserResponse)
