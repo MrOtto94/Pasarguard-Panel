@@ -74,13 +74,10 @@ async def bulk_create_users(
     """
     Bulk create users with configurable username strategies.
 
-    - **user**: Base payload that follows the single user create schema.
-    - **count**: Number of users to generate from the base payload.
-    - **strategy**: Username generation strategy — `provided`, `suffix`, or `random`.
-    - **usernames**: Required when strategy is `provided`.
-    - **suffix_* / random_* fields**: Fine-tune suffix and random strategies.
+    - Includes the standard user creation fields plus `count` and `strategy`.
+    - **strategy**: Username generation strategy — `sequence` or `random`.
 
-    Returns a summary with created users and any per-username errors.
+    Returns subscription URLs for created users.
     """
 
     return await user_operator.bulk_create_users(db, bulk_users, admin)
@@ -356,11 +353,10 @@ async def bulk_create_users_from_template(
     """
     Bulk create users from a template using configurable username strategies.
 
-    - **user**: Base payload for the template creation endpoint.
-    - **count**: Number of users to create.
-    - **strategy**: Username generation strategy — `provided`, `suffix`, or `random`.
+    - Includes the template creation fields plus `count` and `strategy`.
+    - **strategy**: Username generation strategy — `sequence` or `random`.
 
-    Returns a summary with created users and any per-username errors.
+    Returns subscription URLs for created users.
     """
 
     return await user_operator.bulk_create_users_from_template(db, bulk_template_users, admin)
